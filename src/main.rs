@@ -2,28 +2,41 @@ mod eval;
 mod search;
 
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use cozy_chess::util::{display_uci_move, parse_uci_move};
 use cozy_chess::{Board, Color, File, Move, Piece, Rank, Square};
 
 use crate::eval::{Evaluator, SimpleEvaluator};
-use crate::search::{MinimaxSearcher, SearchConfig, SearchEngine, SearchResult, Searcher};
+use crate::search::{MinimaxSearcher, SearchConfig, SearchEngine, Searcher, StopSignal};
 
 const ENGINE_NAME: &str = "Gojo";
 const ENGINE_AUTHOR: &str = "Ian Gui";
+<<<<<<< HEAD
 const DEFAULT_SEARCH_DEPTH: u32 = 4;
+=======
+const DEFAULT_MOVETIME_MS: u64 = 1000;
+const MOVE_OVERHEAD_MS: u64 = 50;
+>>>>>>> 5fff835 (basic alpha-beta pruning and more evaluation metrics)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SearchMode {
+enum ActiveMode {
+    Normal,
     Infinite,
     Ponder,
 }
 
-#[derive(Debug, Clone)]
-struct PendingSearch {
-    mode: SearchMode,
-    bestmove: Option<Move>,
-    board: Board,
+enum SearchState<S: Searcher + 'static, E: Evaluator + Send + 'static> {
+    Idle(SearchEngine<S, E>),
+    Searching {
+        stop: StopSignal,
+        suppress_bestmove: Arc<AtomicBool>,
+        mode: ActiveMode,
+        handle: JoinHandle<SearchEngine<S, E>>,
+    },
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -43,13 +56,15 @@ struct GoParams {
     perft: Option<u32>,
 }
 
-struct UciEngine<S: Searcher = MinimaxSearcher, E: Evaluator = SimpleEvaluator> {
+struct UciEngine<
+    S: Searcher + 'static = MinimaxSearcher,
+    E: Evaluator + Send + 'static = SimpleEvaluator,
+> {
     board: Board,
     history: Vec<u64>,
     debug: bool,
     chess960: bool,
-    pending_search: Option<PendingSearch>,
-    search_engine: SearchEngine<S, E>,
+    search_state: Option<SearchState<S, E>>,
 }
 
 impl UciEngine<MinimaxSearcher, SimpleEvaluator> {
@@ -58,14 +73,14 @@ impl UciEngine<MinimaxSearcher, SimpleEvaluator> {
     }
 }
 
-impl<E: Evaluator> UciEngine<MinimaxSearcher, E> {
+impl<E: Evaluator + Send + 'static> UciEngine<MinimaxSearcher, E> {
     #[cfg(test)]
     fn with_evaluator(evaluator: E) -> Self {
         Self::with_search_engine(SearchEngine::new(MinimaxSearcher::new(), evaluator))
     }
 }
 
-impl<S: Searcher, E: Evaluator> UciEngine<S, E> {
+impl<S: Searcher + 'static, E: Evaluator + Send + 'static> UciEngine<S, E> {
     fn with_search_engine(search_engine: SearchEngine<S, E>) -> Self {
         let board = Board::default();
         let history = vec![board.hash()];
@@ -74,49 +89,133 @@ impl<S: Searcher, E: Evaluator> UciEngine<S, E> {
             history,
             debug: false,
             chess960: false,
-            pending_search: None,
-            search_engine,
+            search_state: Some(SearchState::Idle(search_engine)),
         }
     }
 
-    fn run(&mut self, reader: impl BufRead, mut writer: impl Write) -> io::Result<()> {
+    fn run<R: BufRead, W: Write + Send + 'static>(
+        &mut self,
+        reader: R,
+        writer: W,
+    ) -> io::Result<()> {
+        let shared_out = Arc::new(Mutex::new(writer));
+
         for line in reader.lines() {
             let line = line?;
-            let keep_running = self.handle_command(&line, &mut writer)?;
-            writer.flush()?;
+            let keep_running = self.handle_command(&line, &shared_out)?;
+            if let Ok(mut out) = shared_out.lock() {
+                out.flush()?;
+            }
             if !keep_running {
                 break;
             }
         }
+
+        // On EOF, let a finite search finish cleanly; stop any infinite/ponder search so we don't hang.
+        self.finish_search_on_eof();
+        if let Ok(mut out) = shared_out.lock() {
+            out.flush()?;
+        }
         Ok(())
     }
 
-    fn handle_command(&mut self, line: &str, out: &mut impl Write) -> io::Result<bool> {
+    fn handle_command<W: Write + Send + 'static>(
+        &mut self,
+        line: &str,
+        out: &Arc<Mutex<W>>,
+    ) -> io::Result<bool> {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         let Some(&cmd) = tokens.first() else {
             return Ok(true);
         };
 
         match cmd {
-            "uci" => self.handle_uci(out)?,
+            "uci" => {
+                let mut w = out.lock().unwrap();
+                self.handle_uci(&mut *w)?;
+            }
             "debug" => self.handle_debug(&tokens[1..]),
-            "isready" => writeln!(out, "readyok")?,
-            "setoption" => self.handle_setoption(&tokens[1..], out)?,
+            "isready" => {
+                let mut w = out.lock().unwrap();
+                writeln!(w, "readyok")?;
+            }
+            "setoption" => {
+                let mut w = out.lock().unwrap();
+                self.handle_setoption(&tokens[1..], &mut *w)?;
+            }
             "ucinewgame" => self.handle_ucinewgame(),
-            "position" => self.handle_position(&tokens[1..], out)?,
+            "position" => {
+                self.stop_active_search(true);
+                let mut w = out.lock().unwrap();
+                self.handle_position(&tokens[1..], &mut *w)?;
+            }
             "go" => self.handle_go(&tokens[1..], out)?,
-            "stop" => self.handle_stop(out)?,
-            "ponderhit" => self.handle_ponderhit(out)?,
-            "quit" => return Ok(false),
-            "d" => self.handle_display(out)?,
+            "stop" => self.stop_active_search(false),
+            "ponderhit" => self.handle_ponderhit(),
+            "wait" => self.wait_for_normal_search(),
+            "quit" => {
+                self.stop_active_search(true);
+                return Ok(false);
+            }
+            "d" => {
+                let mut w = out.lock().unwrap();
+                self.handle_display(&mut *w)?;
+            }
             _ => {
                 if self.debug {
-                    writeln!(out, "info string unknown command: {cmd}")?;
+                    let mut w = out.lock().unwrap();
+                    writeln!(w, "info string unknown command: {cmd}")?;
                 }
             }
         }
 
         Ok(true)
+    }
+
+    fn stop_active_search(&mut self, suppress_bestmove: bool) {
+        match self.search_state.take() {
+            Some(SearchState::Searching {
+                stop,
+                suppress_bestmove: suppress_flag,
+                handle,
+                ..
+            }) => {
+                if suppress_bestmove {
+                    suppress_flag.store(true, Ordering::Release);
+                }
+                stop.stop();
+                let engine = handle.join().expect("search thread panicked");
+                self.search_state = Some(SearchState::Idle(engine));
+            }
+            other => {
+                self.search_state = other;
+            }
+        }
+    }
+
+    fn wait_for_normal_search(&mut self) {
+        let is_normal = matches!(
+            self.search_state,
+            Some(SearchState::Searching {
+                mode: ActiveMode::Normal,
+                ..
+            })
+        );
+        if is_normal && let Some(SearchState::Searching { handle, .. }) = self.search_state.take() {
+            let engine = handle.join().expect("search thread panicked");
+            self.search_state = Some(SearchState::Idle(engine));
+        }
+    }
+
+    fn finish_search_on_eof(&mut self) {
+        match self.search_state {
+            Some(SearchState::Searching {
+                mode: ActiveMode::Normal,
+                ..
+            }) => self.wait_for_normal_search(),
+            Some(SearchState::Searching { .. }) => self.stop_active_search(true),
+            _ => {}
+        }
     }
 
     fn handle_uci(&self, out: &mut impl Write) -> io::Result<()> {
@@ -166,10 +265,10 @@ impl<S: Searcher, E: Evaluator> UciEngine<S, E> {
     }
 
     fn handle_ucinewgame(&mut self) {
+        self.stop_active_search(true);
         self.board = Board::default();
         self.history.clear();
         self.history.push(self.board.hash());
-        self.pending_search = None;
     }
 
     fn handle_position(&mut self, args: &[&str], out: &mut impl Write) -> io::Result<()> {
@@ -220,74 +319,118 @@ impl<S: Searcher, E: Evaluator> UciEngine<S, E> {
 
         self.board = board;
         self.history = history;
-        self.pending_search = None;
         Ok(())
     }
 
-    fn handle_go(&mut self, args: &[&str], out: &mut impl Write) -> io::Result<()> {
+    fn handle_go<W: Write + Send + 'static>(
+        &mut self,
+        args: &[&str],
+        out: &Arc<Mutex<W>>,
+    ) -> io::Result<()> {
         let params = self.parse_go_params(args);
 
         if let Some(depth) = params.perft {
-            return self.run_perft_divide(depth, out);
+            self.stop_active_search(true);
+            let mut w = out.lock().unwrap();
+            return self.run_perft_divide(depth, &mut *w);
         }
 
-        let result = self.search(&params);
-        let bestmove = result.best_move;
+        // Stop any previous search before starting a new one.
+        self.stop_active_search(true);
 
-        if let Some(mv) = bestmove {
-            let uci_score = match self.board.side_to_move() {
-                Color::White => result.score,
-                Color::Black => result.score.saturating_neg(),
-            };
-            let mv_str = format_move(&self.board, self.chess960, mv);
-            writeln!(
-                out,
-                "info depth {} score cp {} nodes {} pv {}",
-                result.depth, uci_score, result.nodes, mv_str
-            )?;
-        }
+        let SearchState::Idle(mut search_engine) = self
+            .search_state
+            .take()
+            .expect("search_state is always populated")
+        else {
+            unreachable!("stop_active_search guarantees Idle state");
+        };
 
-        if params.infinite {
-            self.pending_search = Some(PendingSearch {
-                mode: SearchMode::Infinite,
-                bestmove,
-                board: self.board.clone(),
-            });
-            return Ok(());
-        }
+        let mode = if params.infinite {
+            ActiveMode::Infinite
+        } else if params.ponder {
+            ActiveMode::Ponder
+        } else {
+            ActiveMode::Normal
+        };
 
-        if params.ponder {
-            self.pending_search = Some(PendingSearch {
-                mode: SearchMode::Ponder,
-                bestmove,
-                board: self.board.clone(),
-            });
-            return Ok(());
-        }
+        let config = SearchConfig {
+            max_depth: params.depth,
+            max_time: compute_time_limit(&self.board, &params),
+            max_nodes: params.nodes,
+            searchmoves: params.searchmoves,
+        };
 
-        self.write_bestmove(&self.board, bestmove, out)
-    }
+        let stop = search_engine.stop_signal();
+        // Reset synchronously before spawning so an immediate `stop` command can never race.
+        stop.reset();
+        let stop_in_thread = stop.clone();
+        let suppress_bestmove = Arc::new(AtomicBool::new(false));
+        let suppress_in_thread = Arc::clone(&suppress_bestmove);
+        let board = self.board.clone();
+        let chess960 = self.chess960;
+        let writer = Arc::clone(out);
+        let wait_for_stop = matches!(mode, ActiveMode::Infinite | ActiveMode::Ponder);
 
-    fn handle_stop(&mut self, out: &mut impl Write) -> io::Result<()> {
-        self.search_engine.stop();
-        if let Some(pending) = self.pending_search.take() {
-            self.write_bestmove(&pending.board, pending.bestmove, out)?;
-        }
+        let handle = thread::spawn(move || {
+            let result =
+                search_engine.search_with_info_preserving_stop(&board, &config, &mut |info| {
+                    if let Some(mv) = info.best_move {
+                        let uci_score = match board.side_to_move() {
+                            Color::White => info.score,
+                            Color::Black => info.score.saturating_neg(),
+                        };
+                        let mv_str = format_move(&board, chess960, mv);
+                        if let Ok(mut w) = writer.lock() {
+                            let _ = writeln!(
+                                w,
+                                "info depth {} score cp {} nodes {} pv {}",
+                                info.depth, uci_score, info.nodes, mv_str
+                            );
+                            let _ = w.flush();
+                        }
+                    }
+                });
+
+            // In `go infinite` or `go ponder`, UCI requires waiting for `stop`/`ponderhit`
+            // before sending `bestmove`, even if max depth or forced mate was reached early.
+            if wait_for_stop {
+                while !stop_in_thread.is_stopped() {
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+
+            if !suppress_in_thread.load(Ordering::Acquire)
+                && let Ok(mut w) = writer.lock()
+            {
+                let _ = write_bestmove(&board, chess960, result.best_move, &mut *w);
+                let _ = w.flush();
+            }
+
+            search_engine
+        });
+
+        self.search_state = Some(SearchState::Searching {
+            stop,
+            suppress_bestmove,
+            mode,
+            handle,
+        });
+
         Ok(())
     }
 
-    fn handle_ponderhit(&mut self, out: &mut impl Write) -> io::Result<()> {
-        if matches!(
-            self.pending_search,
-            Some(PendingSearch {
-                mode: SearchMode::Ponder,
+    fn handle_ponderhit(&mut self) {
+        let is_ponder = matches!(
+            self.search_state,
+            Some(SearchState::Searching {
+                mode: ActiveMode::Ponder,
                 ..
             })
-        ) && let Some(pending) = self.pending_search.take()
-        {
-            self.write_bestmove(&pending.board, pending.bestmove, out)?;
+        );
+        if is_ponder {
+            self.stop_active_search(false);
         }
-        Ok(())
     }
 
     fn handle_display(&self, out: &mut impl Write) -> io::Result<()> {
@@ -397,14 +540,6 @@ impl<S: Searcher, E: Evaluator> UciEngine<S, E> {
         params
     }
 
-    fn search(&mut self, params: &GoParams) -> SearchResult {
-        let config = SearchConfig {
-            depth: params.depth.unwrap_or(DEFAULT_SEARCH_DEPTH),
-            searchmoves: params.searchmoves.clone(),
-        };
-        self.search_engine.search_with_config(&self.board, &config)
-    }
-
     fn run_perft_divide(&self, depth: u32, out: &mut impl Write) -> io::Result<()> {
         if depth == 0 {
             writeln!(out, "Nodes searched: 1")?;
@@ -430,20 +565,50 @@ impl<S: Searcher, E: Evaluator> UciEngine<S, E> {
         writeln!(out, "Nodes searched: {total}")?;
         Ok(())
     }
+}
 
-    fn write_bestmove(
-        &self,
-        board: &Board,
-        bestmove: Option<Move>,
-        out: &mut impl Write,
-    ) -> io::Result<()> {
-        match bestmove {
-            Some(mv) => {
-                let mv_str = format_move(board, self.chess960, mv);
-                writeln!(out, "bestmove {mv_str}")
-            }
-            None => writeln!(out, "bestmove 0000"),
+fn compute_time_limit(board: &Board, params: &GoParams) -> Option<Duration> {
+    if params.infinite || params.ponder {
+        return None;
+    }
+
+    if let Some(movetime) = params.movetime {
+        return Some(Duration::from_millis(movetime.max(1)));
+    }
+
+    let (time_ms, inc_ms) = match board.side_to_move() {
+        Color::White => (params.wtime, params.winc.unwrap_or(0)),
+        Color::Black => (params.btime, params.binc.unwrap_or(0)),
+    };
+
+    if let Some(time_ms) = time_ms {
+        let moves_to_go = params.movestogo.unwrap_or(30).max(1);
+        let usable = time_ms.saturating_sub(MOVE_OVERHEAD_MS);
+        let base = usable / moves_to_go + inc_ms * 3 / 4;
+        let cap = if moves_to_go == 1 { usable } else { usable / 2 };
+        let alloc_ms = base.min(cap).max(10);
+        return Some(Duration::from_millis(alloc_ms));
+    }
+
+    if params.depth.is_some() || params.nodes.is_some() {
+        return None;
+    }
+
+    Some(Duration::from_millis(DEFAULT_MOVETIME_MS))
+}
+
+fn write_bestmove(
+    board: &Board,
+    chess960: bool,
+    bestmove: Option<Move>,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    match bestmove {
+        Some(mv) => {
+            let mv_str = format_move(board, chess960, mv);
+            writeln!(out, "bestmove {mv_str}")
         }
+        None => writeln!(out, "bestmove 0000"),
     }
 }
 
@@ -543,7 +708,7 @@ fn main() -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut engine = UciEngine::new();
-    engine.run(stdin.lock(), stdout.lock())
+    engine.run(stdin.lock(), stdout)
 }
 
 #[cfg(test)]
@@ -551,13 +716,33 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn run_script(script: &str) -> (UciEngine, String) {
         let mut engine = UciEngine::new();
-        let mut out = Vec::new();
+        let buf = SharedBuf::default();
         engine
-            .run(Cursor::new(script.as_bytes()), &mut out)
+            .run(Cursor::new(script.as_bytes()), buf.clone())
             .expect("UCI loop should not fail on in-memory IO");
-        (engine, String::from_utf8(out).unwrap())
+        (engine, buf.contents())
     }
 
     #[test]
@@ -609,6 +794,7 @@ mod tests {
             "setoption name UCI_Chess960 value true\n\
              position fen rnbqkbnr/ppp2ppp/4p3/3p4/3P4/5NP1/PPP1PPBP/RNBQK2R w KQkq - 0 4\n\
              go searchmoves e1h1\n\
+             wait\n\
              quit\n",
         );
         assert!(engine.chess960);
@@ -620,6 +806,7 @@ mod tests {
         let (_, output) = run_script(
             "position fen rnbqkbnr/ppp2ppp/4p3/3p4/3P4/5NP1/PPP1PPBP/RNBQK2R w KQkq - 0 4\n\
              go searchmoves e1g1\n\
+             wait\n\
              quit\n",
         );
         assert!(output.lines().any(|l| l == "bestmove e1g1"));
@@ -627,7 +814,8 @@ mod tests {
 
     #[test]
     fn go_returns_legal_move_and_handles_no_legal_moves() {
-        let (engine, output) = run_script("position startpos\ngo depth 3 movetime 100\nquit\n");
+        let (engine, output) =
+            run_script("position startpos\ngo depth 3 movetime 500\nwait\nquit\n");
         let bestmove_line = output
             .lines()
             .find(|l| l.starts_with("bestmove "))
@@ -637,40 +825,66 @@ mod tests {
         assert!(engine.board.is_legal(mv));
 
         // Fool's mate: White is checkmated, no legal moves.
-        let (_, mate_out) = run_script("position startpos moves f2f3 e7e5 g2g4 d8h4\ngo\nquit\n");
+        let (_, mate_out) =
+            run_script("position startpos moves f2f3 e7e5 g2g4 d8h4\ngo\nwait\nquit\n");
         assert_eq!(mate_out.trim(), "bestmove 0000");
     }
 
     #[test]
-    fn go_infinite_and_ponder_wait_for_stop_or_ponderhit() {
+    fn go_infinite_and_ponder_wait_for_stop_or_ponderhit_and_allow_isready() {
         let mut engine = UciEngine::new();
-        let mut out = Vec::new();
+        let buf = SharedBuf::default();
+        let out = Arc::new(Mutex::new(buf.clone()));
 
-        engine
-            .handle_command("position startpos", &mut out)
-            .unwrap();
-        engine.handle_command("go infinite", &mut out).unwrap();
-        let before_stop = String::from_utf8(out.clone()).unwrap();
+        engine.handle_command("position startpos", &out).unwrap();
+        engine.handle_command("go infinite", &out).unwrap();
+        thread::sleep(Duration::from_millis(20));
+
+        // `isready` must remain responsive while searching in the background.
+        engine.handle_command("isready", &out).unwrap();
+        let before_stop = buf.contents();
+        assert!(before_stop.lines().any(|l| l == "readyok"));
         assert!(!before_stop.contains("bestmove"));
 
-        engine.handle_command("stop", &mut out).unwrap();
-        let after_stop = String::from_utf8(out).unwrap();
+        engine.handle_command("stop", &out).unwrap();
+        let after_stop = buf.contents();
         assert!(after_stop.lines().any(|l| l.starts_with("bestmove ")));
 
-        let mut ponder_out = Vec::new();
-        engine.handle_command("go ponder", &mut ponder_out).unwrap();
+        let ponder_buf = SharedBuf::default();
+        let ponder_out = Arc::new(Mutex::new(ponder_buf.clone()));
+        engine.handle_command("go ponder", &ponder_out).unwrap();
+        thread::sleep(Duration::from_millis(15));
+        assert!(!ponder_buf.contents().contains("bestmove"));
+
+        engine.handle_command("ponderhit", &ponder_out).unwrap();
         assert!(
-            !String::from_utf8(ponder_out.clone())
-                .unwrap()
-                .contains("bestmove")
-        );
-        engine.handle_command("ponderhit", &mut ponder_out).unwrap();
-        assert!(
-            String::from_utf8(ponder_out)
-                .unwrap()
+            ponder_buf
+                .contents()
                 .lines()
                 .any(|l| l.starts_with("bestmove "))
         );
+    }
+
+    #[test]
+    fn go_movetime_iteratively_deepens_past_depth_three() {
+        let (_, output) = run_script(
+            "position fen 6k1/5p2/8/8/8/8/5P2/4R1K1 w - - 0 1\n\
+             go movetime 120\n\
+             wait\n\
+             quit\n",
+        );
+        let max_depth = output
+            .lines()
+            .filter_map(|l| l.strip_prefix("info depth "))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .filter_map(|d| d.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_depth > 3,
+            "expected iterative deepening past depth 3, got max depth {max_depth}\n{output}"
+        );
+        assert!(output.lines().any(|l| l.starts_with("bestmove ")));
     }
 
     #[test]
@@ -752,14 +966,14 @@ mod tests {
     #[test]
     fn custom_evaluator_score_is_reported_in_go_info() {
         let mut engine = UciEngine::with_evaluator(|b: &Board| b.occupied().len() as eval::Score);
-        let mut out = Vec::new();
+        let buf = SharedBuf::default();
         engine
             .run(
-                Cursor::new(b"position startpos\ngo depth 1\nquit\n"),
-                &mut out,
+                Cursor::new(b"position startpos\ngo depth 1\nwait\nquit\n"),
+                buf.clone(),
             )
             .unwrap();
-        let output = String::from_utf8(out).unwrap();
+        let output = buf.contents();
         assert!(
             output
                 .lines()
@@ -772,6 +986,7 @@ mod tests {
         let (_, output) = run_script(
             "position fen 6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1\n\
              go depth 1\n\
+             wait\n\
              quit\n",
         );
         assert!(output.lines().any(|l| l == "bestmove d1d8"));

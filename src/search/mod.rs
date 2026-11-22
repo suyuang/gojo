@@ -2,6 +2,7 @@ mod minimax;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use cozy_chess::{Board, Move};
 
@@ -37,10 +38,14 @@ impl StopSignal {
 }
 
 /// Parameters controlling a search invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchConfig {
-    /// Maximum search depth in plies.
-    pub depth: u32,
+    /// Optional maximum search depth in plies (`None` = deepen iteratively until stopped/time/nodes).
+    pub max_depth: Option<u32>,
+    /// Optional maximum wall-clock time budget for the search.
+    pub max_time: Option<Duration>,
+    /// Optional maximum nodes to visit before stopping.
+    pub max_nodes: Option<u64>,
     /// Optional restriction of root moves to search (empty searches all legal moves).
     pub searchmoves: Vec<Move>,
 }
@@ -48,36 +53,61 @@ pub struct SearchConfig {
 impl SearchConfig {
     pub fn with_depth(depth: u32) -> Self {
         Self {
-            depth,
-            searchmoves: Vec::new(),
+            max_depth: Some(depth),
+            ..Self::default()
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_time(duration: Duration) -> Self {
+        Self {
+            max_time: Some(duration),
+            ..Self::default()
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn infinite() -> Self {
+        Self::default()
     }
 }
 
-/// Outcome of a search invocation.
+/// Outcome of a search invocation (or an intermediate iterative-deepening iteration).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchResult {
     /// Best legal move found, if any.
     pub best_move: Option<Move>,
     /// Evaluation score in centipawns (positive favors White, negative favors Black).
     pub score: Score,
-    /// Depth searched in plies.
+    /// Depth completed in plies.
     pub depth: u32,
     /// Total nodes visited during the search.
     pub nodes: u64,
-    /// Whether the search terminated early due to a [`StopSignal`].
+    /// Whether the search terminated early due to a stop/time/node limit.
     pub stopped: bool,
 }
 
 /// Abstraction for a chess search algorithm (e.g., minimax, alpha-beta, MCTS).
 pub trait Searcher: Send {
+    fn search_with_info(
+        &mut self,
+        board: &Board,
+        evaluator: &dyn Evaluator,
+        config: &SearchConfig,
+        stop: &StopSignal,
+        on_info: &mut dyn FnMut(&SearchResult),
+    ) -> SearchResult;
+
+    #[allow(dead_code)]
     fn search(
         &mut self,
         board: &Board,
         evaluator: &dyn Evaluator,
         config: &SearchConfig,
         stop: &StopSignal,
-    ) -> SearchResult;
+    ) -> SearchResult {
+        self.search_with_info(board, evaluator, config, stop, &mut |_| {})
+    }
 }
 
 /// High-level search engine pairing a [`Searcher`] algorithm, an [`Evaluator`],
@@ -99,12 +129,12 @@ impl<S: Searcher, E: Evaluator> SearchEngine<S, E> {
 
     /// Returns a cloneable handle that can be used (including from another thread)
     /// to stop an active search.
-    #[allow(dead_code)]
     pub fn stop_signal(&self) -> StopSignal {
         self.stop.clone()
     }
 
     /// Request that the current search stop.
+    #[allow(dead_code)]
     pub fn stop(&self) {
         self.stop.stop();
     }
@@ -116,10 +146,26 @@ impl<S: Searcher, E: Evaluator> SearchEngine<S, E> {
     }
 
     /// Search `board` using the provided [`SearchConfig`].
+    #[allow(dead_code)]
     pub fn search_with_config(&mut self, board: &Board, config: &SearchConfig) -> SearchResult {
         self.stop.reset();
         self.searcher
             .search(board, &self.evaluator, config, &self.stop)
+    }
+
+    /// Search `board` using the existing [`StopSignal`] state without resetting it,
+    /// reporting each completed depth via `on_info`.
+    ///
+    /// Callers spawning a worker thread should call `stop_signal.reset()` before
+    /// spawning to avoid racing with an immediate `stop()` call.
+    pub fn search_with_info_preserving_stop(
+        &mut self,
+        board: &Board,
+        config: &SearchConfig,
+        on_info: &mut dyn FnMut(&SearchResult),
+    ) -> SearchResult {
+        self.searcher
+            .search_with_info(board, &self.evaluator, config, &self.stop, on_info)
     }
 }
 
@@ -129,23 +175,25 @@ mod tests {
     use crate::eval::SimpleEvaluator;
 
     struct StubSearcher {
-        last_depth: u32,
+        last_depth: Option<u32>,
     }
 
     impl Searcher for StubSearcher {
-        fn search(
+        fn search_with_info(
             &mut self,
             board: &Board,
             evaluator: &dyn Evaluator,
             config: &SearchConfig,
             stop: &StopSignal,
+            on_info: &mut dyn FnMut(&SearchResult),
         ) -> SearchResult {
-            self.last_depth = config.depth;
+            self.last_depth = config.max_depth;
+            let depth = config.max_depth.unwrap_or(1);
             if stop.is_stopped() {
                 return SearchResult {
                     best_move: None,
                     score: 0,
-                    depth: config.depth,
+                    depth,
                     nodes: 0,
                     stopped: true,
                 };
@@ -155,13 +203,15 @@ mod tests {
                 first_move = moves.into_iter().next();
                 first_move.is_some()
             });
-            SearchResult {
+            let result = SearchResult {
                 best_move: first_move,
                 score: evaluator.evaluate(board),
-                depth: config.depth,
+                depth,
                 nodes: 1,
                 stopped: false,
-            }
+            };
+            on_info(&result);
+            result
         }
     }
 
@@ -183,7 +233,7 @@ mod tests {
 
     #[test]
     fn search_engine_delegates_to_searcher_and_evaluator() {
-        let mut engine = SearchEngine::new(StubSearcher { last_depth: 0 }, SimpleEvaluator);
+        let mut engine = SearchEngine::new(StubSearcher { last_depth: None }, SimpleEvaluator);
         let result = engine.search(&Board::default(), 4);
 
         assert_eq!(result.depth, 4);
@@ -191,6 +241,6 @@ mod tests {
         assert_eq!(result.nodes, 1);
         assert!(result.best_move.is_some());
         assert!(!result.stopped);
-        assert_eq!(engine.searcher.last_depth, 4);
+        assert_eq!(engine.searcher.last_depth, Some(4));
     }
 }

@@ -5,3 +5,7 @@
   - Bishop is 3.1
   - Knight is 3
   - Pawn is 1
+- Give bonus space (Pieces on opponent side of board)
+- Give bonus for king safety (closer to own corner)
+- Give bonus for centralized pieces (closer to center and deduct for pieces on the edge)
+- Adjust for pawn structure (deduct for doubled pawn and isolated pawn, bonus for passed pawns)
