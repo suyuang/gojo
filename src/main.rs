@@ -11,7 +11,7 @@ use crate::search::{MinimaxSearcher, SearchConfig, SearchEngine, SearchResult, S
 
 const ENGINE_NAME: &str = "Gojo";
 const ENGINE_AUTHOR: &str = "Ian Gui";
-const DEFAULT_SEARCH_DEPTH: u32 = 3;
+const DEFAULT_SEARCH_DEPTH: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchMode {
